@@ -1,0 +1,181 @@
+#include <Timer.h>
+#include "RadioAndAck.h"
+#include "printf.h"
+
+module SensorNodeC {
+  uses interface Boot;
+  uses interface Leds;
+  // 定时器 SendTimer 用于定时采集并发送数据
+  uses interface Timer<TMilli> as SendTimer;
+  // 定时器 AckTimer 用于等待ACK超时
+  uses interface Timer<TMilli> as AckTimer;
+  uses interface Packet;
+  uses interface AMSend;
+  uses interface SplitControl as AMControl;
+  uses interface Receive;
+  uses interface Read<uint16_t> as ReadTemp;
+  uses interface Read<uint16_t> as ReadHumidity;
+} 
+implementation {
+
+  // 假设的正常原始采样值及15%波动上下限（温度以20°C为基准）
+  enum {
+    NORMAL_TEMP_RAW = 5960,      // 对应约20°C
+    TEMP_LOW_THRESHOLD = 5656,   // 约17°C对应的原始值
+    TEMP_HIGH_THRESHOLD = 6260,  // 约23°C对应的原始值
+    NORMAL_HUMID_RAW = 2500,     // 假设正常湿度原始值
+    HUMID_LOW_THRESHOLD = 2125,  // 2500*0.85
+    HUMID_HIGH_THRESHOLD = 2875, // 2500*1.15
+  };
+
+  uint16_t counter = 0;    // 数据包计数器
+  uint16_t temp = 0;       // 当前温度原始值
+  uint16_t humid = 0;      // 当前湿度原始值
+  bool busy = FALSE;       // 表示无线电正在发送数据
+  bool waitingAck = FALSE; // 表示正在等待ACK
+  uint32_t sendPeriod = 5000; // 默认发送周期为5000ms（5秒）
+  message_t pkt;           // 数据包缓冲区
+
+  // 保存上一次发送的数据（用于重发）
+  uint16_t lastCounter = 0;
+  uint16_t lastTemp = 0;
+  uint16_t lastHumid = 0;
+
+  bool radioOn = FALSE;    // 指示无线电是否开启
+
+  // 系统启动时：开启无线电，开启前点亮LED0（无线电指示灯）
+  event void Boot.booted() {
+    call Leds.led0On(); 
+    call AMControl.start();
+  }
+
+  // 无线电启动完成后
+  event void AMControl.startDone(error_t err) {
+    if (err == SUCCESS) {
+      radioOn = TRUE;
+      // 启动发送定时器
+      call SendTimer.startOneShot(sendPeriod);
+    } else {
+      call AMControl.start();
+    }
+  }
+
+  // 无线电关闭完成后
+  event void AMControl.stopDone(error_t err) {
+    radioOn = FALSE;
+  }
+
+  // 定时发送数据包
+  event void SendTimer.fired() {
+    // 如果无线电未开启，则启动无线电
+    if (!radioOn) {
+      call Leds.led0On();
+      call AMControl.start();
+      call SendTimer.startOneShot(sendPeriod);
+      return;
+    }
+    // 如果正在等待ACK，则本次不发送新数据包
+    if (waitingAck) {
+      call SendTimer.startOneShot(sendPeriod);
+      return;
+    }
+    counter++; // 增加计数器
+
+    // 请求采集温度和湿度（采集操作为异步，回调中设置全局变量）
+    call ReadTemp.read();
+    call ReadHumidity.read();
+    // 此处假设数据读取足够快，已经存储在 temp 与 humid 中
+
+    // 根据采集数据调整发送周期：若温度或湿度超出正常值15%的范围，则发送周期改为500ms
+    if ((temp < TEMP_LOW_THRESHOLD || temp > TEMP_HIGH_THRESHOLD) ||
+        (humid < HUMID_LOW_THRESHOLD || humid > HUMID_HIGH_THRESHOLD)) {
+      sendPeriod = 500;
+    } else {
+      sendPeriod = 5000;
+    }
+
+    // 获取数据包缓冲区并填充数据
+    RadioAndAckMsg* data = (RadioAndAckMsg *) call Packet.getPayload(&pkt, sizeof(RadioAndAckMsg));
+    if (data == NULL) {
+      call SendTimer.startOneShot(sendPeriod);
+      return;
+    }
+    // 保存当前数据以便于重发
+    lastCounter = counter;
+    lastTemp = temp;
+    lastHumid = humid;
+    data->nodeid = TOS_NODE_ID;
+    data->counter = counter;
+    data->temp = temp;
+    data->humid = humid;
+    
+    // 发送数据前点亮LED1表示正在发送
+    call Leds.led1On();
+    if (call AMSend.send(AM_BROADCAST_ADDR, &pkt, sizeof(RadioAndAckMsg)) == SUCCESS) {
+      busy = TRUE;
+      waitingAck = TRUE;
+      // 启动ACK超时定时器，设为1000ms
+      call AckTimer.startOneShot(1000);
+    } else {
+      call SendTimer.startOneShot(sendPeriod);
+    }
+  }
+
+  // ACK超时：若超时未收到ACK，则重发数据包
+  event void AckTimer.fired() {
+    if (waitingAck) {
+      RadioAndAckMsg* data = (RadioAndAckMsg *) call Packet.getPayload(&pkt, sizeof(RadioAndAckMsg));
+      if (data == NULL) {
+        call SendTimer.startOneShot(sendPeriod);
+        return;
+      }
+      data->nodeid = TOS_NODE_ID;
+      data->counter = lastCounter;
+      data->temp = lastTemp;
+      data->humid = lastHumid;
+      if (call AMSend.send(AM_BROADCAST_ADDR, &pkt, sizeof(RadioAndAckMsg)) == SUCCESS) {
+        busy = TRUE;
+        // 重启ACK超时定时器
+        call AckTimer.startOneShot(1000);
+      } else {
+        call SendTimer.startOneShot(sendPeriod);
+      }
+    }
+  }
+
+  // 数据包发送完成回调（发送成功后关闭发送LED）
+  event void AMSend.sendDone(message_t* msg, error_t error) {
+    if (&pkt == msg) {
+      busy = FALSE;
+      call Leds.led1Off();
+      // 此处不关闭无线电，因为还需要等待ACK
+    }
+  }
+
+  // 接收回来的消息（这里专门用于接收ACK消息）
+  event message_t* Receive.receive(message_t* msg, void* payload, uint8_t len) {
+    if (len == sizeof(RadioAckMsg)) {
+      RadioAckMsg* ack = (RadioAckMsg*)payload;
+      // 检查ACK是否对应于上一次发送的计数器
+      if (ack->ack == lastCounter) {
+        waitingAck = FALSE;
+        // 收到正确ACK后，关闭无线电以节省功耗，关闭LED0（无线电指示灯）
+        call Leds.led0Off();
+        call AMControl.stop();
+        // 启动下一次发送定时器
+        call SendTimer.startOneShot(sendPeriod);
+      }
+    }
+    return msg;
+  }
+
+  // 温度读取完成回调
+  event void ReadTemp.readDone(error_t error, uint16_t value) {
+    temp = value;
+  }
+
+  // 湿度读取完成回调
+  event void ReadHumidity.readDone(error_t error, uint16_t value) {
+    humid = value;
+  }
+}
